@@ -1,6 +1,7 @@
-﻿using System.Diagnostics;
-using Microsoft.Toolkit.Uwp.Notifications;
+﻿
+using System.Diagnostics;
 using System.CommandLine;
+using System.Runtime.InteropServices;
 
 var shouldKill = true;
 long limitInGb = 2;
@@ -43,6 +44,8 @@ if (args.Contains("--help") || args.Contains("-h"))
     return;
 }
 
+ShowNotification(0, shouldKill, limitInGb);
+
 HashSet<int> exceededProcesses = [];
 
 while (true)
@@ -50,7 +53,7 @@ while (true)
     var dotnetProcesses = Process.GetProcessesByName("dotnet");
     foreach (var process in dotnetProcesses)
     {
-        var memoryUsage = process.PrivateMemorySize64;
+        var memoryUsage = process.VirtualMemorySize64;
         var calculatedLimit = limitInGb * 1024 * 1024 * 1024;
 
         if (memoryUsage > calculatedLimit && IsJetBrainsRoslynWorker(process))
@@ -60,7 +63,7 @@ while (true)
                 continue;
             }
 
-            ShowNotification(process.Id, shouldKill);
+            ShowNotification(process.Id, shouldKill, limitInGb);
 
             if (shouldKill)
             {
@@ -82,33 +85,104 @@ while (true)
 
 static bool IsJetBrainsRoslynWorker(Process process)
 {
-    var startInfo = new ProcessStartInfo("wmic")
+    try
     {
-        Arguments = $"process where processid=\"{process.Id}\" get CommandLine",
-        RedirectStandardOutput = true,
-        UseShellExecute = false,
-        CreateNoWindow = true
-    };
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        {
+            // On macOS, use 'ps' command to get command line
+            var startInfo = new ProcessStartInfo("ps")
+            {
+                Arguments = $"-p {process.Id} -o command=",
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
 
-    using var wmicProcess = Process.Start(startInfo);
-    var output = wmicProcess?.StandardOutput.ReadToEnd();
-    return output?.Contains("JetBrains.Roslyn.Worker.exe") ?? false;
+            using var psProcess = Process.Start(startInfo);
+            var output = psProcess?.StandardOutput.ReadToEnd();
+            psProcess?.WaitForExit();
+            return output?.Contains("JetBrains.Roslyn.Worker") ?? false;
+        }
+    }
+    catch
+    {
+        // Ignore errors (process might have exited)
+    }
+
+    return false;
 }
 
 
-static void ShowNotification(int processId, bool shouldKill)
+static void ShowNotification(int processId, bool shouldKill, long limitInGb)
 {
-    var text =
-        $"Roslyn Worker dotnet process \"{processId}\" has exceeded the memory limit.{(shouldKill ? " Killing..." : "")}";
+    string title;
+    string message;
 
-    new ToastContentBuilder()
-        .AddText("Memory Limit Exceeded")
-        .AddText(text)
-        .AddAudio(new ToastAudio
+    if (processId == 0)
+    {
+        title = "DotNetMon is running";
+        message = $"Monitoring JetBrains Roslyn Worker processes. Limit: {limitInGb} GB. {(shouldKill ? "Offending processes will be terminated." : "Processes will NOT be killed.")}";
+    }
+    else
+    {
+        title = "Roslyn Worker memory limit exceeded";
+        message = $"Process {processId} exceeded {limitInGb} GB.{(shouldKill ? " Terminating..." : " Not terminating.")}";
+    }
+
+    if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+    {
+        // Use osascript to show native macOS notification. Note: Do not wrap the -e script in single quotes when UseShellExecute=false
+        try
         {
-            Silent = false,
-            Loop = false,
-            Src = new Uri("ms-winsoundevent:Notification.Looping.Alarm10")
-        })
-        .Show();
+            string EscapeAppleScript(string s) => s.Replace("\\", "\\\\").Replace("\"", "\\\"");
+            var escapedMsg = EscapeAppleScript(message);
+            var escapedTitle = EscapeAppleScript(title);
+            var startInfo = new ProcessStartInfo("/usr/bin/osascript")
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardError = true,
+                RedirectStandardOutput = true
+            };
+            // Important: pass -e and the whole AppleScript as a single argument to avoid it being split into multiple tokens
+            startInfo.ArgumentList.Add("-e");
+            startInfo.ArgumentList.Add($"display notification \"{escapedMsg}\" with title \"{escapedTitle}\" sound name \"Basso\"");
+            using var p = Process.Start(startInfo);
+            bool needFallback = false;
+            if (p == null)
+            {
+                needFallback = true;
+            }
+            else
+            {
+                p.WaitForExit(3000);
+                if (p.ExitCode != 0)
+                {
+                    var err = p.StandardError.ReadToEnd();
+                    Console.WriteLine($"Failed to show notification (exit {p.ExitCode}): {err}");
+                    needFallback = true;
+                }
+            }
+
+            // Fallback to a short dialog if notification fails (more visible)
+            if (needFallback)
+            {
+                var fallback = new ProcessStartInfo("/usr/bin/osascript")
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                fallback.ArgumentList.Add("-e");
+                fallback.ArgumentList.Add($"display dialog \"{escapedMsg}\" with title \"{escapedTitle}\" giving up after 5");
+                Process.Start(fallback);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Failed to show notification: {ex.Message}");
+        }
+    }
+    
+    // Always log to console as well
+    Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] ALERT: {title}: {message}");
 }
