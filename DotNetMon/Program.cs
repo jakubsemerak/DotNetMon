@@ -44,8 +44,6 @@ if (args.Contains("--help") || args.Contains("-h"))
     return;
 }
 
-ShowNotification(0, shouldKill, limitInGb);
-
 HashSet<int> exceededProcesses = [];
 
 while (true)
