@@ -1,5 +1,4 @@
-﻿
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.CommandLine;
 using System.Runtime.InteropServices;
 
@@ -46,12 +45,13 @@ if (args.Contains("--help") || args.Contains("-h"))
 
 HashSet<int> exceededProcesses = [];
 
+Console.WriteLine("Monitoring JetBrains Roslyn Worker processes...");
 while (true)
 {
     var dotnetProcesses = Process.GetProcessesByName("dotnet");
     foreach (var process in dotnetProcesses)
     {
-        var memoryUsage = process.VirtualMemorySize64;
+        var memoryUsage = GetVirtualMemoryBytes(process);
         var calculatedLimit = limitInGb * 1024 * 1024 * 1024;
 
         if (memoryUsage > calculatedLimit && IsJetBrainsRoslynWorker(process))
@@ -61,7 +61,7 @@ while (true)
                 continue;
             }
 
-            ShowNotification(process.Id, shouldKill, limitInGb);
+            ShowNotification(process.Id, shouldKill, limitInGb, memoryUsage);
 
             if (shouldKill)
             {
@@ -81,6 +81,40 @@ while (true)
 }
 
 
+static long GetVirtualMemoryBytes(Process process)
+{
+    try
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        {
+            // Get resident memory size (RSS column in KB) using ps
+            // RSS represents actual physical memory used by the process
+            var startInfo = new ProcessStartInfo("ps")
+            {
+                Arguments = $"-p {process.Id} -o rss=",
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            using var psProcess = Process.Start(startInfo);
+            var output = psProcess?.StandardOutput.ReadToEnd().Trim();
+            psProcess?.WaitForExit();
+
+            // ps returns RSS in kilobytes on macOS
+            if (long.TryParse(output, out var rssInKb))
+            {
+                return rssInKb * 1024; // Convert to bytes
+            }
+        }
+    }
+    catch
+    {
+        // Fallback to WorkingSet64 if ps fails
+    }
+
+    return process.WorkingSet64;
+}
 static bool IsJetBrainsRoslynWorker(Process process)
 {
     try
@@ -111,7 +145,7 @@ static bool IsJetBrainsRoslynWorker(Process process)
 }
 
 
-static void ShowNotification(int processId, bool shouldKill, long limitInGb)
+static void ShowNotification(int processId, bool shouldKill, long limitInGb, long memoryUsage = 0)
 {
     string title;
     string message;
@@ -123,8 +157,16 @@ static void ShowNotification(int processId, bool shouldKill, long limitInGb)
     }
     else
     {
+        var memoryUsageInMb = memoryUsage / (1024.0 * 1024.0);
+        var memoryUsageInGb = memoryUsage / (1024.0 * 1024.0 * 1024.0);
+        
+        // Show MB if less than 1 GB, otherwise show GB
+        string memoryDisplay = memoryUsageInGb >= 1.0 
+            ? $"{memoryUsageInGb:F2} GB" 
+            : $"{memoryUsageInMb:F0} MB";
+        
         title = "Roslyn Worker memory limit exceeded";
-        message = $"Process {processId} exceeded {limitInGb} GB.{(shouldKill ? " Terminating..." : " Not terminating.")}";
+        message = $"Process {processId} used {memoryDisplay} (limit: {limitInGb} GB).{(shouldKill ? " Terminating..." : " Not terminating.")}";
     }
 
     if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
